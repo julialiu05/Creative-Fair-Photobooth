@@ -690,26 +690,37 @@ async function enumerateCameras() {
       opt.textContent = d.label || `Camera ${i + 1}`;
       el.cameraSelect.appendChild(opt);
     });
-    if (videoDevices.length <= 1) {
-      el.cameraSelect.style.display = 'none';
-    } else {
-      el.cameraSelect.style.display = '';
-    }
-  } catch (e) {}
+    // Always show selector so the user can switch cameras
+    el.cameraSelect.style.display = videoDevices.length > 0 ? '' : 'none';
+    return videoDevices;
+  } catch (e) { return []; }
+}
+
+async function findExternalCamera() {
+  const devices = await enumerateCameras();
+  if (devices.length === 0) return null;
+  // Prefer an external camera over the built-in one
+  const builtInKeywords = ['facetime', 'isight', 'built-in', 'integrated', 'internal', 'front camera'];
+  const external = devices.find(d =>
+    !builtInKeywords.some(kw => (d.label || '').toLowerCase().includes(kw))
+  );
+  return external ? external.deviceId : devices[0].deviceId;
 }
 
 async function startCamera(deviceId) {
   try {
+    // If no deviceId given, try to find an external camera first
+    if (!deviceId) {
+      deviceId = await findExternalCamera();
+    }
     const constraints = {
       video: {
-        width: { ideal: 1280 }, height: { ideal: 960 },
+        width: { ideal: 1920 }, height: { ideal: 1080 },
       },
       audio: false,
     };
     if (deviceId) {
       constraints.video.deviceId = { exact: deviceId };
-    } else {
-      constraints.video.facingMode = 'user';
     }
     if (state.stream) {
       state.stream.getTracks().forEach(t => t.stop());
@@ -717,6 +728,14 @@ async function startCamera(deviceId) {
     state.stream = await navigator.mediaDevices.getUserMedia(constraints);
     el.cameraVideo.srcObject = state.stream;
     await enumerateCameras();
+    // Sync the dropdown to the active camera
+    const activeTrack = state.stream.getVideoTracks()[0];
+    if (activeTrack) {
+      const settings = activeTrack.getSettings();
+      if (settings.deviceId) {
+        el.cameraSelect.value = settings.deviceId;
+      }
+    }
   } catch (err) {
     alert('Could not access camera. Please allow camera permissions and try again.');
     setView('welcome');
@@ -735,21 +754,40 @@ el.cameraSelect.addEventListener('change', () => {
   startCamera(el.cameraSelect.value);
 });
 
-function captureFrame() {
-  const video = el.cameraVideo;
+function drawFrameToCanvas(source) {
   const canvas = el.captureCanvas;
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
+  const w = source.videoWidth || source.width;
+  const h = source.videoHeight || source.height;
+  canvas.width = w;
+  canvas.height = h;
   const ctx = canvas.getContext('2d');
-  ctx.translate(canvas.width, 0);
+  ctx.translate(w, 0);
   ctx.scale(-1, 1);
-  ctx.drawImage(video, 0, 0);
+  ctx.drawImage(source, 0, 0, w, h);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.globalCompositeOperation = 'multiply';
   ctx.fillStyle = 'rgba(255, 245, 230, 0.08)';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillRect(0, 0, w, h);
   ctx.globalCompositeOperation = 'source-over';
   return canvas.toDataURL('image/jpeg', 0.92);
+}
+
+async function captureFrame() {
+  // Use ImageCapture API to trigger the camera's real shutter + flash
+  if (state.stream && typeof ImageCapture !== 'undefined') {
+    try {
+      const track = state.stream.getVideoTracks()[0];
+      const imageCapture = new ImageCapture(track);
+      // takePhoto() triggers the camera hardware (fires flash if connected)
+      const blob = await imageCapture.takePhoto();
+      const bitmap = await createImageBitmap(blob);
+      return drawFrameToCanvas(bitmap);
+    } catch (e) {
+      console.warn('ImageCapture takePhoto failed, falling back to video frame:', e);
+    }
+  }
+  // Fallback: grab frame from video stream
+  return drawFrameToCanvas(el.cameraVideo);
 }
 
 function doFlash() {
@@ -775,8 +813,8 @@ async function startCaptureSequence() {
     }
     el.countdown.classList.remove('visible');
     doFlash();
-    await sleep(100);
-    state.photos.push(captureFrame());
+    const photo = await captureFrame();
+    state.photos.push(photo);
     if (shot < 2) await sleep(600);
   }
 
